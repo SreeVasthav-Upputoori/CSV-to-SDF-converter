@@ -198,7 +198,7 @@ def load_data_file(file_path):
     
     except Exception as e:
         logging.error(f"Error reading file {file_path}: {e}")
-        print(f"❌ Error reading file: {e}")
+        print(f" Error reading file: {e}")
         return None
 
 def identify_columns(df):
@@ -228,7 +228,7 @@ def identify_columns(df):
     print(f"   SMILES column: {smiles_col if smiles_col else 'Not found'}")
     
     # Let user confirm or select manually
-    print(f"\n📋 Available columns:")
+    print(f"\n Available columns:")
     for i, col in enumerate(columns, 1):
         sample_data = str(df[col].dropna().iloc[0])[:50] if not df[col].dropna().empty else "No data"
         print(f"{i:2d}. {col:<20} (Sample: {sample_data})")
@@ -273,8 +273,11 @@ def identify_columns(df):
     
     return name_col, smiles_col
 
-def process_molecule(data):
-    """Process a single molecule entry"""
+# Global variable for hydrogen handling mode
+HYDROGEN_MODE = 3  # Default: Smart mode
+
+def process_molecule_with_mode(data):
+    """Process molecule based on selected hydrogen handling mode"""
     idx, name, smiles = data
     
     # Handle missing or invalid data
@@ -295,42 +298,83 @@ def process_molecule(data):
             logging.warning(f"Entry {idx}: Invalid SMILES '{smiles}' for {name}")
             return None
         
-        # Add hydrogens and generate 3D coordinates
-        mol = Chem.AddHs(mol)
+        if HYDROGEN_MODE == 1:
+            # Mode 1: Preserve original structure (no hydrogen addition)
+            final_mol = mol
+            final_mol.SetProp("Structure", "Original")
+            final_mol.SetProp("Hydrogens", "Implicit")
+            logging.info(f"Entry {idx}: Preserved original structure for {name}")
+            
+        elif HYDROGEN_MODE == 2:
+            # Mode 2: Always add explicit hydrogens
+            mol_with_h = Chem.AddHs(mol)
+            embed_result = AllChem.EmbedMolecule(mol_with_h, AllChem.ETKDG())
+            
+            if embed_result == 0:
+                try:
+                    AllChem.MMFFOptimizeMolecule(mol_with_h, maxIters=200)
+                except:
+                    pass
+                final_mol = mol_with_h
+                final_mol.SetProp("Structure", "3D_with_H")
+            else:
+                final_mol = mol_with_h
+                final_mol.SetProp("Structure", "2D_with_H")
+            
+            final_mol.SetProp("Hydrogens", "Explicit")
+            logging.info(f"Entry {idx}: Added explicit hydrogens for {name}")
+            
+        else:
+            # Mode 3: Smart mode (default)
+            mol_with_h = Chem.AddHs(mol)
+            embed_result = AllChem.EmbedMolecule(mol_with_h, AllChem.ETKDG())
+            
+            if embed_result == 0:
+                # 3D successful - keep hydrogens and optimize
+                try:
+                    AllChem.MMFFOptimizeMolecule(mol_with_h, maxIters=200)
+                except:
+                    pass
+                final_mol = mol_with_h
+                final_mol.SetProp("Structure", "3D")
+                final_mol.SetProp("Hydrogens", "Added_for_3D")
+                logging.info(f"Entry {idx}: Generated 3D coordinates with H for {name}")
+            else:
+                # 3D failed - use original structure without added hydrogens
+                final_mol = mol
+                final_mol.SetProp("Structure", "2D_Original")
+                final_mol.SetProp("Hydrogens", "Implicit")
+                logging.info(f"Entry {idx}: Kept original 2D structure for {name}")
         
-        # Try to embed molecule in 3D
-        embed_result = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
-        if embed_result != 0:
-            # If 3D embedding fails, try without 3D coordinates
-            logging.warning(f"Entry {idx}: 3D embedding failed for {name}, using 2D")
-            mol = Chem.RemoveHs(mol)  # Remove Hs for 2D
+        # Set molecule properties
+        final_mol.SetProp("_Name", str(name))
+        final_mol.SetProp("ID", str(idx))
+        final_mol.SetProp("SMILES", smiles)
         
-        # Set molecule name property
-        mol.SetProp("_Name", str(name))
-        mol.SetProp("ID", str(idx))
-        mol.SetProp("SMILES", smiles)
-        
-        # Calculate molecular properties
+        # Calculate properties using original molecule (more accurate)
         mol_weight = Descriptors.MolWt(mol)
         logp = Descriptors.MolLogP(mol)
         hbd = Descriptors.NumHDonors(mol)
         hba = Descriptors.NumHAcceptors(mol)
+        tpsa = Descriptors.TPSA(mol)
+        rotatable_bonds = Descriptors.NumRotatableBonds(mol)
         
-        # Set additional properties
-        mol.SetProp("MolWt", f"{mol_weight:.2f}")
-        mol.SetProp("LogP", f"{logp:.2f}")
-        mol.SetProp("HBD", str(hbd))
-        mol.SetProp("HBA", str(hba))
+        # Set molecular properties
+        final_mol.SetProp("MolWt", f"{mol_weight:.2f}")
+        final_mol.SetProp("LogP", f"{logp:.2f}")
+        final_mol.SetProp("HBD", str(hbd))
+        final_mol.SetProp("HBA", str(hba))
+        final_mol.SetProp("TPSA", f"{tpsa:.2f}")
+        final_mol.SetProp("RotBonds", str(rotatable_bonds))
         
-        logging.info(f"Entry {idx}: Successfully processed {name}")
-        return mol
+        return final_mol
         
     except Exception as e:
         logging.error(f"Entry {idx}: Error processing {name} with SMILES '{smiles}': {e}")
         return None
 
 def convert_to_sdf(input_file):
-    """Convert CSV/Excel file to SDF format"""
+    """Convert CSV/Excel file to SDF format with structure preservation"""
     print("\n Starting conversion process...")
     
     # Load the data file
@@ -341,11 +385,33 @@ def convert_to_sdf(input_file):
     # Identify the name and SMILES columns
     name_col, smiles_col = identify_columns(df)
     
+    # Ask user about hydrogen handling preference
+    print(f"\n Hydrogen Handling Options:")
+    print("1. Preserve original structure (recommended for visualization)")
+    print("2. Add explicit hydrogens for 3D coordinates")
+    print("3. Smart mode (add H only if 3D generation succeeds)")
+    
+    while True:
+        try:
+            h_choice = input("Select option (1-3) [default: 3]: ").strip()
+            if not h_choice:
+                h_choice = "3"
+            if h_choice in ['1', '2', '3']:
+                break
+            print("Please enter 1, 2, or 3")
+        except KeyboardInterrupt:
+            print("\nOperation cancelled.")
+            return
+    
+    global HYDROGEN_MODE
+    HYDROGEN_MODE = int(h_choice)
+    
     # Prepare data for processing
     df_clean = df[[name_col, smiles_col]].copy()
     df_clean = df_clean.dropna(subset=[smiles_col])  # Remove rows with missing SMILES
-
+    
     print(f"\n Processing {len(df_clean)} molecules...")
+    print(f" Hydrogen mode: {['', 'Preserve original', 'Add explicit H', 'Smart mode'][HYDROGEN_MODE]}")
     
     # Create output filename
     base_name = os.path.splitext(input_file)[0]
@@ -359,10 +425,10 @@ def convert_to_sdf(input_file):
     successful_molecules = []
     failed_count = 0
     
-    print(" Processing molecules...")
+    print("  Processing molecules...")
     with ThreadPoolExecutor(max_workers=4) as executor:
         # Submit all tasks
-        future_to_data = {executor.submit(process_molecule, data): data for data in molecules_data}
+        future_to_data = {executor.submit(process_molecule_with_mode, data): data for data in molecules_data}
         
         # Collect results as they complete
         for future in as_completed(future_to_data):
@@ -388,13 +454,18 @@ def convert_to_sdf(input_file):
             print(f" Output saved as: {output_sdf}")
             
             if failed_count > 0:
-                print(f"⚠️  {failed_count} molecules failed to convert (check conversion.log for details)")
+                print(f"  {failed_count} molecules failed to convert (check conversion.log for details)")
             
-            # Display summary
-            print(f"\n📊 Conversion Summary:")
+            # Display summary with structure information
+            structure_3d = sum(1 for mol in successful_molecules if mol.HasProp("Structure") and mol.GetProp("Structure") == "3D")
+            structure_2d = len(successful_molecules) - structure_3d
+            
+            print(f"\n Conversion Summary:")
             print(f"   Input file: {input_file}")
             print(f"   Total molecules: {len(molecules_data)}")
             print(f"   Successfully converted: {len(successful_molecules)}")
+            print(f"   With 3D coordinates: {structure_3d}")
+            print(f"   With 2D structure: {structure_2d}")
             print(f"   Failed conversions: {failed_count}")
             print(f"   Output file: {output_sdf}")
             
